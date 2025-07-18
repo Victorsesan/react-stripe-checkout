@@ -1,0 +1,252 @@
+//Test file
+
+/*
+ * Copyright The OpenTelemetry Authors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+package io.opentelemetry.android.export;
+
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+import io.opentelemetry.sdk.common.CompletableResultCode;
+import io.opentelemetry.sdk.trace.data.SpanData;
+import io.opentelemetry.sdk.trace.export.SpanExporter;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
+import org.junit.Before;
+import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.mockito.Mock;
+import org.mockito.junit.MockitoJUnitRunner;
+
+@RunWith(MockitoJUnitRunner.class)
+public class RateLimitedExporterTest {
+
+    @Mock private SpanExporter mockDelegate;
+    private RateLimitedExporter exporter;
+
+    @Before
+    public void setUp() {
+ when(mockDelegate.export(any())).thenReturn(CompletableResultCode.ofSuccess());
+    }
+
+    private static List<SpanData> createSpans(int num) {
+        List<SpanData> spans = new ArrayList<>();
+        for (int i = 0; i < num; i++) {
+            spans.add(mock(SpanData.class));
+        }
+        return spans;
+    }
+
+    @Test
+    public void export_whenUnderLimit_sendsToDelegate() {
+        //Test that spans are exported when the count is below the maximum.
+        exporter = RateLimitedExporter.newBuilder(mockDelegate).maxSpansPerPeriod(10).build();
+        List<SpanData> spans = createSpans(5);
+
+        CompletableResultCode result = exporter.export(spans);
+
+        assertTrue(result.isSuccess());
+        verify(mockDelegate).export(spans);
+    }
+
+    @Test
+    public void export_whenAtLimit_sendsToDelegate() {
+        //Test the edge case where the number of spans equals the maximum.
+        exporter = RateLimitedExporter.newBuilder(mockDelegate).maxSpansPerPeriod(10).build();
+        List<SpanData> spans = createSpans(10);
+
+        CompletableResultCode result = exporter.export(spans);
+
+        assertTrue(result.isSuccess());
+        verify(mockDelegate).export(spans);
+    }
+
+    @Test
+    public void export_whenOverLimit_isThrottled() {
+        // Test that subsequent exports are throttled after the limit is met.
+        exporter = RateLimitedExporter.newBuilder(mockDelegate).maxSpansPerPeriod(10).build();
+        List<SpanData> initialSpans = createSpans(10);
+        List<SpanData> throttledSpans = createSpans(1);
+
+        // First export meets the limit
+        exporter.export(initialSpans);
+        verify(mockDelegate).export(initialSpans);
+
+        // Second export should be throttled
+        CompletableResultCode result = exporter.export(throttledSpans);
+
+        assertFalse(result.isSuccess());
+        // This verify the delegate was NOT called for the throttled batch.
+        verify(mockDelegate, times(1)).export(any());
+    }
+
+    @Test
+    public void export_throttlingResetsAfterPeriod() throws InterruptedException {
+        // Test that throttling stops after the time window resets.
+        exporter =
+                RateLimitedExporter.newBuilder(mockDelegate)
+                        .maxSpansPerPeriod(10)
+                        .setPeriod(Duration.ofMillis(100))
+                        .build();
+
+        List<SpanData> initialSpans = createSpans(10);
+        List<SpanData> nextSpans = createSpans(5);
+
+        // Export to meet the limit
+        exporter.export(initialSpans);
+        CompletableResultCode throttledResult = exporter.export(nextSpans);
+        assertFalse(throttledResult.isSuccess());
+
+        // This wait for the period to elapse
+        Thread.sleep(150);
+        CompletableResultCode successResult = exporter.export(nextSpans);
+        assertTrue(successResult.isSuccess());
+        verify(mockDelegate, times(2)).export(any());
+    }
+
+    @Test
+    public void export_whenDelegateFails_doesNotIncrementCount() {
+        // Professional comment: Ensure the span count is not updated if the delegate fails to export.
+        exporter = RateLimitedExporter.newBuilder(mockDelegate).maxSpansPerPeriod(10).build();
+
+        List<SpanData> failedSpans = createSpans(10);
+        List<SpanData> subsequentSpans = createSpans(5);
+
+        // Make the delegate fail for the first call
+        when(mockDelegate.export(failedSpans)).thenReturn(CompletableResultCode.ofFailure());
+
+        // This export will fail
+        CompletableResultCode failedResult = exporter.export(failedSpans);
+        assertFalse(failedResult.isSuccess());
+        verify(mockDelegate).export(failedSpans);
+
+        // Make the delegate succeed again
+        when(mockDelegate.export(subsequentSpans)).thenReturn(CompletableResultCode.ofSuccess());
+
+        // This export should succeed because the counter was not incremented by the failed export
+        CompletableResultCode successResult = exporter.export(subsequentSpans);
+        assertTrue(successResult.isSuccess());
+        verify(mockDelegate).export(subsequentSpans);
+    }
+
+    @Test
+    public void flushAndShutdown_areDelegated() {
+        // Professional comment: Ensure flush and shutdown calls are passed to the delegate.
+        exporter = RateLimitedExporter.newBuilder(mockDelegate).build();
+
+        exporter.flush();
+        verify(mockDelegate).flush();
+
+        exporter.shutdown();
+        verify(mockDelegate).shutdown();
+    }
+}
+
+//Main file
+
+/*
+ * Copyright The OpenTelemetry Authors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+package com.opentelemetry.android;
+
+import io.opentelemetry.sdk.common.CompletableResultCode;
+import io.opentelemetry.sdk.trace.data.SpanData;
+import io.opentelemetry.sdk.trace.export.SpanExporter;
+import java.time.Duration;
+import java.util.Collection;
+import java.util.concurrent.atomic.AtomicIntege;
+import java.util.concurrent.atomic.AtomicLong;
+
+public final class RateLimitedExporter implements SpanExporter {
+    private final SpanExporter delegate;
+    private final int maxSpansPerPeriod;
+    private final long periodMillis;
+    private final AtomicLong periodStartTime;
+    private final AtomicInteger spansExportedInPeriod;
+
+    private RateLimitedExporter(Builder builder) {
+        this.delegate = builder.delegate;
+        this.maxSpansPerPeriod = builder.maxSpansPerPeriod;
+        this.periodMillis = builder.period.toMillis();
+        // Since we are also running versions older than 8.0, we will use  System.currentTimeMillis() instead of java.time.Clock.
+        this.periodStartTime = new AtomicLong(System.currentTimeMillis());
+        this.spansExportedInPeriod = new AtomicInteger(0);
+    }
+
+    public static Builder newBuilder(SpanExporter delegate) {
+        return new Builder(delegate);
+    }
+
+    @Override
+    public CompletableResultCode export(Collection<SpanData> spans) {
+        // This check if the time window has elapsed and reset if necessary.
+        long now = System.currentTimeMillis();
+        long currentPeriodStart = periodStartTime.get();
+        if (now - currentPeriodStart > periodMillis) {
+            periodStartTime.set(now);
+            spansExportedInPeriod.set(0);
+        }
+
+        // If the number of spans exported in the current window has reached the max, It will return a failure to signal backpressure to the caller.
+        if (spansExportedInPeriod.get() >= maxSpansPerPeriod) {
+            return CompletableResultCode.ofFailure();
+        }
+
+        // Export the whole batch and update the count upon success.
+        // This "lets the last batch through" even if it exceeds the limit.
+        CompletableResultCode result = delegate.export(spans);
+        result.whenComplete(
+                () -> {
+                    if (result.isSuccess()) {
+                        spansExportedInPeriod.addAndGet(spans.size());
+                    }
+                });
+        return result;
+    }
+
+    @Override
+    public CompletableResultCode flush() {
+        return delegate.flush();
+    }
+
+    @Override
+    public CompletableResultCode shutdown() {
+        return delegate.shutdown();
+    }
+
+    public static class Builder {
+        private final SpanExporter delegate;
+        private int maxSpansPerPeriod = 100;
+        private Duration period = Duration.ofSeconds(60);
+
+        private Builder(SpanExporter delegate) {
+            this.delegate = delegate;
+        }
+
+        public Builder maxSpansPerPeriod(int maxSpansPerPeriod) {
+            this.maxSpansPerPeriod = maxSpansPerPeriod;
+            return this;
+        }
+
+        public Builder setPeriod(Duration period) {
+            this.period = period;
+            return this;
+        }
+
+        public RateLimitedExporter build() {
+            return new RateLimitedExporter(this);
+        }
+    }
+}
